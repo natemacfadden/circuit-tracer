@@ -1,4 +1,5 @@
 import warnings
+import weakref
 from collections import defaultdict
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -12,6 +13,11 @@ from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
 
 from circuit_tracer.attribution.context_transformerlens import AttributionContext
+from circuit_tracer.attribution.linear_adjoint import (
+    LinearAdjoint,
+    adjoint_supported,
+    frozen_state_hooks,
+)
 from circuit_tracer.transcoder import TranscoderSet
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
 from circuit_tracer.utils import get_default_device
@@ -71,6 +77,7 @@ class TransformerLensReplacementModel(HookedTransformer):
     skip_transcoder: bool
     scan_name: str | list[str] | None
     backend: Literal["transformerlens"]
+    use_linear_adjoint: bool  # set to False to attribute with autograd instead
 
     @classmethod
     def from_config(
@@ -446,14 +453,41 @@ class TransformerLensReplacementModel(HookedTransformer):
         mlp_out_cache, mlp_out_caching_hooks, _ = self.get_caching_hooks(
             lambda name: self.feature_output_hook in name
         )
-        logits = self.run_with_hooks(tokens, fwd_hooks=mlp_in_caching_hooks + mlp_out_caching_hooks)
+        use_adjoint = adjoint_supported(self)
+        frozen: dict = {}
+        frozen_hooks = frozen_state_hooks(self, frozen) if use_adjoint else []
+        logits = self.run_with_hooks(
+            tokens, fwd_hooks=mlp_in_caching_hooks + mlp_out_caching_hooks + frozen_hooks
+        )
+
+        # Attribution only reads the last position's logits; keeping the full
+        # (n_pos, d_vocab) tensor would pin ~1 GB at 1k tokens for the whole run.
+        # ``ctx.logits`` recomputes all positions (one forward pass) if anyone asks.
+        logits = logits[:, -1:].clone()
+        model_ref = weakref.ref(self)
+
+        @torch.no_grad()
+        def full_logits():
+            model = model_ref()
+            if model is None:
+                raise RuntimeError("the model this attribution context came from is gone")
+            return model(tokens)
 
         mlp_in_cache = torch.cat(list(mlp_in_cache.values()), dim=0)
         mlp_out_cache = torch.cat(list(mlp_out_cache.values()), dim=0)
 
-        attribution_data = self.transcoders.compute_attribution_components(
-            mlp_in_cache, self.zero_positions
-        )
+        if use_adjoint and isinstance(self.transcoders, TranscoderSet):
+            # Only the selected features' encoder rows are ever used: gather them lazily.
+            attribution_data = self.transcoders.compute_attribution_components(
+                mlp_in_cache,
+                self.zero_positions,
+                lazy_encoders=True,
+                dedup_decoders=True,
+            )
+        else:
+            attribution_data = self.transcoders.compute_attribution_components(
+                mlp_in_cache, self.zero_positions
+            )
 
         # Compute error vectors
         error_vectors = mlp_out_cache - attribution_data["reconstruction"]
@@ -461,7 +495,7 @@ class TransformerLensReplacementModel(HookedTransformer):
         error_vectors[:, self.zero_positions] = 0
         token_vectors = self.W_E[tokens].detach()  # (n_pos, d_model)
 
-        return AttributionContext(
+        ctx = AttributionContext(
             activation_matrix=attribution_data["activation_matrix"],
             logits=logits,
             error_vectors=error_vectors,
@@ -470,7 +504,34 @@ class TransformerLensReplacementModel(HookedTransformer):
             encoder_vecs=attribution_data["encoder_vecs"],
             encoder_to_decoder_map=attribution_data["encoder_to_decoder_map"],
             decoder_locations=attribution_data["decoder_locations"],
+            full_logits_fn=full_logits,
+            decoder_factors=(
+                (
+                    attribution_data["decoder_table"],
+                    attribution_data["decoder_rows"],
+                    attribution_data["decoder_scale"],
+                )
+                if attribution_data["decoder_vecs"] is None
+                else None
+            ),
         )
+        if use_adjoint:
+            ctx.adjoint = LinearAdjoint(
+                self,
+                frozen,
+                n_pos=len(tokens),
+                row_size=ctx._row_size,
+                n_active=ctx.activation_matrix._nnz(),
+                error_vectors=error_vectors,
+                token_vectors=token_vectors,
+                decoder_vecs=attribution_data["decoder_vecs"],
+                encoder_to_decoder_map=attribution_data["encoder_to_decoder_map"],
+                decoder_locations=attribution_data["decoder_locations"],
+                decoder_table=attribution_data.get("decoder_table"),
+                decoder_rows=attribution_data.get("decoder_rows"),
+                decoder_scale=attribution_data.get("decoder_scale"),
+            )
+        return ctx
 
     def setup_intervention_with_freeze(
         self,

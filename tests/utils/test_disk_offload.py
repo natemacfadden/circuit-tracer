@@ -217,3 +217,23 @@ def test_cleanup_when_no_files():
     # Second cleanup should find nothing
     n_removed = cleanup_all_offload_files()
     assert n_removed == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cpu_offload_staging_pipeline():
+    """Tiny staging buffers so tensors span several buffers and the ring wraps around:
+    every byte must arrive, parameters keep their identity, as with module.to("cpu")."""
+    from circuit_tracer.utils.disk_offload import _HostStager
+
+    module = torch.nn.Module()
+    module.a = torch.nn.Parameter(torch.randn(37, 11, device="cuda"))
+    module.b = torch.nn.Parameter(torch.randn(5, device="cuda", dtype=torch.bfloat16))
+    module.register_buffer("c", torch.randint(0, 9, (301,), device="cuda"))
+    before = {k: v.clone() for k, v in module.state_dict().items()}
+    param_a = module.a
+    stager = _HostStager(n_buffers=2, buffer_bytes=96, piece_bytes=40)
+    module._apply(stager)
+    stager.close()
+    assert module.a is param_a
+    for k, v in module.state_dict().items():
+        assert v.device.type == "cpu" and torch.equal(v, before[k].cpu()), k

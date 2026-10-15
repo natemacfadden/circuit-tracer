@@ -13,9 +13,11 @@ from einops import einsum
 from transformer_lens.hook_points import HookPoint
 
 if TYPE_CHECKING:
+    from circuit_tracer.attribution.linear_adjoint import LinearAdjoint
     from circuit_tracer.replacement_model.replacement_model_transformerlens import (
         TransformerLensReplacementModel,
     )
+    from circuit_tracer.transcoder.single_layer_transcoder import LazyEncoderVectors
 
 
 class AttributionContext:
@@ -49,30 +51,105 @@ class AttributionContext:
         error_vectors: torch.Tensor,
         token_vectors: torch.Tensor,
         decoder_vecs: torch.Tensor,
-        encoder_vecs: torch.Tensor,
+        encoder_vecs: "torch.Tensor | LazyEncoderVectors",
         encoder_to_decoder_map: torch.Tensor,
         decoder_locations: torch.Tensor,
         logits: torch.Tensor,
+        *,
+        full_logits_fn: Callable[[], torch.Tensor] | None = None,
+        decoder_factors: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         n_layers, n_pos, _ = activation_matrix.shape
 
         # Forward-pass cache
         self._resid_activations: list[torch.Tensor | None] = [None] * (n_layers + 1)
+        # Optional LinearAdjoint: applies the frozen model's transposed Jacobian directly
+        # (no replicated forward / autograd). Set by ``setup_attribution`` when supported.
+        self.adjoint: "LinearAdjoint | None" = None
         self._batch_buffer: torch.Tensor | None = None
         self.n_layers: int = n_layers
 
-        self.logits = logits
+        # ``logits`` may be only the last position (the linear-adjoint setup keeps just
+        # that); ``full_logits_fn`` then recomputes all positions on first access of
+        # ``self.logits``. ``decoder_vecs`` may be None with ``decoder_factors`` =
+        # (table, rows, scale) and ``encoder_vecs`` a LazyEncoderVectors; the public
+        # attributes materialize upstream's tensors on first access (see below).
+        self._logits = logits
+        self._full_logits_fn = full_logits_fn
         self.activation_matrix = activation_matrix
         self.error_vectors = error_vectors
         self.token_vectors = token_vectors
-        self.decoder_vecs = decoder_vecs
-        self.encoder_vecs = encoder_vecs
+        self._decoder_vecs = decoder_vecs
+        self._decoder_factors = decoder_factors
+        self._encoder_vecs = encoder_vecs
 
         self.encoder_to_decoder_map = encoder_to_decoder_map
         self.decoder_locations = decoder_locations
 
         total_active_feats = activation_matrix._nnz()
         self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
+
+    # ------------------------------------------------------------------ public tensors
+    # Upstream's AttributionContext exposes ``logits`` (1, n_pos, d_vocab), ``decoder_vecs``
+    # and ``encoder_vecs`` (n_active, d_model) as plain tensors. The linear-adjoint setup
+    # keeps cheaper forms (last-position logits, a deduplicated decoder table, encoder
+    # rows gathered on demand); these properties rebuild upstream's tensors on first
+    # access and cache them. Doing so costs what upstream always pays: the full
+    # logits (n_pos * d_vocab floats, recomputed with one forward pass of the model) and
+    # two (n_active, d_model) tensors. The attribution driver itself never touches them.
+
+    @property
+    def logits(self) -> torch.Tensor:
+        if self._full_logits_fn is not None:
+            self._logits = self._full_logits_fn()
+            self._full_logits_fn = None
+        return self._logits
+
+    @logits.setter
+    def logits(self, value: torch.Tensor) -> None:
+        self._logits, self._full_logits_fn = value, None
+
+    @property
+    def last_logits(self) -> torch.Tensor:
+        """Logits at the last position (no recomputation).
+
+        Returns:
+            torch.Tensor: ``(1, 1, d_vocab)`` logits.
+        """
+        return self._logits[:, -1:]
+
+    @property
+    def decoder_vecs(self) -> torch.Tensor:
+        if self._decoder_vecs is None and self._decoder_factors is not None:
+            table, rows, scale = self._decoder_factors
+            # bit-identical to the eager path's W_dec rows scaled by their activations
+            self._decoder_vecs = table[rows] * scale[:, None]
+        return self._decoder_vecs
+
+    @decoder_vecs.setter
+    def decoder_vecs(self, value: torch.Tensor) -> None:
+        self._decoder_vecs, self._decoder_factors = value, None
+
+    @property
+    def encoder_vecs(self) -> torch.Tensor:
+        if not isinstance(self._encoder_vecs, torch.Tensor):
+            self._encoder_vecs = self._encoder_vecs.materialize()
+        return self._encoder_vecs
+
+    @encoder_vecs.setter
+    def encoder_vecs(self, value: torch.Tensor) -> None:
+        self._encoder_vecs = value
+
+    def encoder_rows(self, idx: torch.Tensor) -> torch.Tensor:
+        """``encoder_vecs[idx]`` without materializing the whole tensor.
+
+        Args:
+            idx (torch.Tensor): Indices of active features.
+
+        Returns:
+            torch.Tensor: ``(len(idx), d_model)`` encoder vectors.
+        """
+        return self._encoder_vecs[idx]
 
     def _caching_hooks(self, feature_input_hook: str) -> list[tuple[str, Callable]]:
         """Return hooks that store residual activations layer-by-layer."""
@@ -186,6 +263,9 @@ class AttributionContext:
         Returns:
             torch.Tensor: ``(batch, row_size)`` matrix - one row per node.
         """
+
+        if self.adjoint is not None:
+            return self.adjoint.compute(layers, positions, inject_values)
 
         batch_size = self._resid_activations[0].shape[0]  # type: ignore
         self._batch_buffer = torch.zeros(

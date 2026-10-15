@@ -1,8 +1,13 @@
+import json
 import os
+import struct
 import warnings
+import weakref
+from collections import deque
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -114,8 +119,10 @@ class SingleLayerTranscoder(nn.Module):
 
         if isinstance(to_read, torch.Tensor):
             to_read = to_read.cpu()
-        with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
-            return f.get_slice("W_dec")[to_read].to(self.dtype)
+        # safetensors can't index-slice straight into MPS memory: read on the host there
+        read_device = "cpu" if self.device.type == "mps" else str(self.device)
+        with safe_open(self.transcoder_path, framework="pt", device=read_device) as f:
+            return f.get_slice("W_dec")[to_read].to(self.device, self.dtype)
 
     def encode(self, input_acts, apply_activation_function: bool = True):
         W_enc = self.W_enc
@@ -148,12 +155,16 @@ class SingleLayerTranscoder(nn.Module):
 
         return decoded
 
-    def encode_sparse(self, input_acts, zero_positions: slice = slice(0, 1)):
+    def encode_sparse(
+        self, input_acts, zero_positions: slice = slice(0, 1), return_encoders: bool = True
+    ):
         """Encode and return sparse activations with active encoder vectors.
 
         Args:
             input_acts: Input activations
             zero_positions: slice representing the positions to zero out
+            return_encoders: if False, skip gathering the encoder vectors (returns None
+                in their place)
 
         Returns:
             sparse_acts: Sparse tensor of activations
@@ -166,13 +177,26 @@ class SingleLayerTranscoder(nn.Module):
         acts[zero_positions] = 0
 
         sparse_acts = acts.to_sparse()
+        if not return_encoders:
+            return sparse_acts, None
         _, feat_idx = sparse_acts.indices()
         active_encoders = W_enc[feat_idx]
 
         return sparse_acts, active_encoders
 
-    def decode_sparse(self, sparse_acts, input_acts: torch.Tensor | None = None):
+    def decode_sparse(
+        self,
+        sparse_acts,
+        input_acts: torch.Tensor | None = None,
+        active_decoders: torch.Tensor | None = None,
+    ):
         """Decode sparse activations and return reconstruction with scaled decoder vectors.
+
+        Args:
+            sparse_acts: Sparse (n_pos, d_transcoder) activations from ``encode_sparse``
+            input_acts: Input activations (required with a skip connection)
+            active_decoders: optional, already-loaded ``W_dec`` rows of the active features
+                (in ``self.dtype``); they are scaled **in place** and returned.
 
         Returns:
             reconstruction: Decoded output
@@ -182,15 +206,30 @@ class SingleLayerTranscoder(nn.Module):
         values = sparse_acts.values()
 
         # Get decoder vectors for active features only
-        W_dec = self._get_decoder_vectors(feat_idx.cpu())
-        scaled_decoders = W_dec * values[:, None]
+        if active_decoders is not None:
+            scaled_decoders = active_decoders.mul_(values[:, None])
+        else:
+            W_dec = self._get_decoder_vectors(feat_idx.cpu())
+            scaled_decoders = W_dec * values[:, None]
 
-        # Reconstruct using index_add
         n_pos = sparse_acts.shape[0]
-        reconstruction = torch.zeros(
-            n_pos, self.d_model, device=sparse_acts.device, dtype=sparse_acts.dtype
-        )
-        reconstruction = reconstruction.index_add_(0, pos_idx, scaled_decoders)
+        if sparse_acts.is_coalesced() and sparse_acts.is_cuda:
+            # Indices are sorted by position: a segmented sum is deterministic (each
+            # position's rows are summed in order), unlike index_add_'s CUDA atomics,
+            # which made the error vectors (and so every graph) differ run to run.
+            # Other devices keep upstream's index_add_: it is deterministic on CPU,
+            # and there faster and (in bf16) more accurate than segment_reduce,
+            # which has no MPS kernel.
+            bounds = torch.searchsorted(
+                pos_idx, torch.arange(n_pos + 1, device=pos_idx.device, dtype=pos_idx.dtype)
+            )
+            reconstruction = torch.segment_reduce(
+                scaled_decoders, "sum", lengths=bounds.diff(), axis=0, unsafe=True
+            ).to(sparse_acts.dtype)
+        else:
+            reconstruction = torch.zeros(
+                n_pos, self.d_model, device=sparse_acts.device, dtype=sparse_acts.dtype
+            ).index_add_(0, pos_idx, scaled_decoders)
         if self.W_skip is not None:
             assert input_acts is not None, (
                 "Transcoder has skip connection but no input_acts were provided"
@@ -339,13 +378,27 @@ class TranscoderSet(nn.Module):
         )
 
     def compute_attribution_components(
-        self, mlp_inputs: torch.Tensor, zero_positions: slice = slice(0, 1)
-    ) -> dict[str, torch.Tensor]:
+        self,
+        mlp_inputs: torch.Tensor,
+        zero_positions: slice = slice(0, 1),
+        lazy_encoders: bool = False,
+        dedup_decoders: bool = False,
+    ) -> dict[str, Any]:
         """Extract active features and their encoder/decoder vectors for attribution.
 
         Args:
             mlp_inputs: (n_layers, n_pos, d_model) tensor of MLP inputs
             zero_positions: (slice) slice indicating which positions to zero out
+            lazy_encoders: if True, ``encoder_vecs`` is a :class:`LazyEncoderVectors`
+                that gathers rows of ``W_enc`` on indexing instead of an
+                ``(n_active, d_model)`` tensor (only a few rows are ever used).
+            dedup_decoders: if True (and everything is fp32), ``decoder_vecs`` is None
+                and the decoders are returned factored as ``decoder_table`` (each
+                active (layer, feature)'s unscaled ``W_dec`` row once),
+                ``decoder_rows`` (int32 row into the table per active feature) and
+                ``decoder_scale`` (its activation), with
+                ``decoder_vecs[i] == decoder_table[decoder_rows[i]] * decoder_scale[i]``
+                bit-for-bit. A feature active at many positions is stored once.
 
         Returns:
             Dict containing all components needed for AttributionContext:
@@ -354,36 +407,165 @@ class TranscoderSet(nn.Module):
                 - encoder_vecs: Concatenated encoder vectors for active features
                 - decoder_vecs: Concatenated decoder vectors (scaled by activations)
                 - encoder_to_decoder_map: Mapping from encoder to decoder indices
+                - decoder_table, decoder_rows, decoder_scale: the factored decoders
+                  (with ``dedup_decoders``; ``decoder_vecs`` is then None)
         """
         device = mlp_inputs.device
 
         reconstruction = torch.zeros_like(mlp_inputs)
-        encoder_vectors = []
-        decoder_vectors = []
         sparse_acts_list = []
+        encoder_vectors = []
 
         for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore
             sparse_acts, active_encoders = transcoder.encode_sparse(
-                mlp_inputs[layer], zero_positions=zero_positions
+                mlp_inputs[layer], zero_positions=zero_positions, return_encoders=not lazy_encoders
             )
-            reconstruction[layer], active_decoders = transcoder.decode_sparse(
-                sparse_acts, mlp_inputs[layer]
-            )
-            encoder_vectors.append(active_encoders)
-            decoder_vectors.append(active_decoders)
             sparse_acts_list.append(sparse_acts)
+            encoder_vectors.append(active_encoders)
+
+        if (
+            dedup_decoders
+            and all(transcoder.dtype == torch.float32 for transcoder in self.transcoders)
+            and mlp_inputs.dtype == torch.float32
+        ):
+            return self._dedup_attribution_components(
+                mlp_inputs,
+                sparse_acts_list,
+                encoder_vectors,
+                reconstruction,
+                lazy_encoders,
+            )
+
+        # Fill decoder (and encoder) vectors into preallocated buffers layer by layer, so
+        # the per-layer chunks and the concatenated result never coexist in full.
+        n_active = sum(acts._nnz() for acts in sparse_acts_list)
+        d_model = self[0].d_model
+        # In the transcoders' dtype (what decode_sparse / W_enc return), not that of
+        # mlp_inputs: TransformerLens hands over fp32 inputs for bf16/fp16 models too.
+        decoder_vecs = torch.empty(n_active, d_model, device=device, dtype=self[0].dtype)
+        encoder_vecs = (
+            None
+            if lazy_encoders
+            else torch.empty(n_active, d_model, device=device, dtype=encoder_vectors[0].dtype)
+        )
+        # Lazily-loaded decoders: read every layer's active rows straight from the
+        # (memory-mapped) files into ``decoder_vecs`` with a pipelined pinned upload,
+        # instead of one blocking safetensors slice read + pageable copy per layer.
+        jobs = []
+        start = 0
+        for sparse_acts in sparse_acts_list:
+            jobs.append((sparse_acts.indices()[1], start))
+            start += sparse_acts._nnz()
+        prefetched = self._prefetch_lazy_rows(jobs, decoder_vecs)
+        start = 0
+        for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore
+            sparse_acts = sparse_acts_list[layer]
+            end = start + sparse_acts._nnz()
+            reconstruction[layer], active_decoders = transcoder.decode_sparse(
+                sparse_acts,
+                mlp_inputs[layer],
+                active_decoders=decoder_vecs[start:end] if prefetched else None,
+            )
+            if not prefetched:  # else already scaled in place inside decoder_vecs
+                decoder_vecs[start:end] = active_decoders
+            del active_decoders
+            if encoder_vecs is not None:
+                encoder_vecs[start:end] = encoder_vectors[layer]
+                encoder_vectors[layer] = None
+            start = end
 
         activation_matrix = torch.stack(sparse_acts_list).coalesce()
         encoder_to_decoder_map = torch.arange(activation_matrix._nnz(), device=device)
+        if lazy_encoders:
+            encoder_vecs = LazyEncoderVectors(self, activation_matrix.indices())
 
         return {
             "activation_matrix": activation_matrix,
             "reconstruction": reconstruction,
-            "encoder_vecs": torch.cat(encoder_vectors, dim=0),
-            "decoder_vecs": torch.cat(decoder_vectors, dim=0),
+            "encoder_vecs": encoder_vecs,
+            "decoder_vecs": decoder_vecs,
             "encoder_to_decoder_map": encoder_to_decoder_map,
             "decoder_locations": activation_matrix.indices()[:2],
         }
+
+    def _dedup_attribution_components(
+        self,
+        mlp_inputs,
+        sparse_acts_list,
+        encoder_vectors,
+        reconstruction,
+        lazy_encoders,
+    ):
+        """``compute_attribution_components`` with factored (deduplicated) decoders."""
+        device = mlp_inputs.device
+        d_model = self[0].d_model
+        uniques, rows_list, scales = [], [], []
+        n_table = 0
+        for sparse_acts in sparse_acts_list:
+            uniq, inverse = torch.unique(sparse_acts.indices()[1], return_inverse=True)
+            uniques.append((uniq, n_table))
+            rows_list.append(inverse.to(torch.int32) + n_table)
+            scales.append(sparse_acts.values())
+            n_table += uniq.numel()
+        table = torch.empty(n_table, d_model, device=device, dtype=mlp_inputs.dtype)
+        if not self._prefetch_lazy_rows(uniques, table):
+            for transcoder, (uniq, offset) in zip(self, uniques):
+                table[offset : offset + uniq.numel()] = transcoder._get_decoder_vectors(uniq.cpu())
+        n_active = sum(rows.numel() for rows in rows_list)
+        encoder_vecs = None if lazy_encoders else torch.empty(n_active, d_model, device=device)
+        start = 0
+        for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore
+            sparse_acts = sparse_acts_list[layer]
+            end = start + sparse_acts._nnz()
+            # same rows, scaled in place by decode_sparse exactly as in the dense path
+            active_decoders = table[rows_list[layer]]
+            reconstruction[layer], _ = transcoder.decode_sparse(
+                sparse_acts, mlp_inputs[layer], active_decoders=active_decoders
+            )
+            del active_decoders
+            if encoder_vecs is not None:
+                encoder_vecs[start:end] = encoder_vectors[layer]
+                encoder_vectors[layer] = None
+            start = end
+
+        activation_matrix = torch.stack(sparse_acts_list).coalesce()
+        if lazy_encoders:
+            encoder_vecs = LazyEncoderVectors(self, activation_matrix.indices())
+        return {
+            "activation_matrix": activation_matrix,
+            "reconstruction": reconstruction,
+            "encoder_vecs": encoder_vecs,
+            "decoder_vecs": None,
+            "decoder_table": table,
+            "decoder_rows": torch.cat(rows_list),
+            "decoder_scale": torch.cat(scales),
+            "encoder_to_decoder_map": torch.arange(activation_matrix._nnz(), device=device),
+            "decoder_locations": activation_matrix.indices()[:2],
+        }
+
+    def _prefetch_lazy_rows(self, jobs, out: torch.Tensor) -> bool:
+        """``out[offset : offset + len(ids)] = W_dec_layer[ids]`` (unscaled rows) for each
+        layer's ``(ids, offset)``, read straight from the memory-mapped files with a
+        pipelined pinned upload.
+
+        Only for lazily-loaded decoders on CUDA whose file dtype equals both the
+        transcoder dtype and ``out.dtype`` (so the result is bit-identical to the
+        per-layer path). Returns False (doing nothing) otherwise.
+        """
+        if not out.is_cuda:
+            return False
+        views = []
+        for transcoder in self.transcoders:
+            if not transcoder.lazy_decoder or transcoder.dtype != out.dtype:
+                return False
+            view = _safetensors_mmap_view(transcoder, "W_dec")
+            if view is None or view.dtype != out.dtype:
+                return False
+            views.append(view)
+        _upload_rows_pipelined(
+            [(view, ids.cpu(), offset) for view, (ids, offset) in zip(views, jobs)], out
+        )
+        return True
 
     def encode_layer(self, x, layer_id, apply_activation_function=True):
         return self.transcoders[layer_id].encode(
@@ -642,3 +824,230 @@ def load_transcoder_set(
         feature_output_hook=feature_output_hook,
         scan_name=scan_name,
     )
+
+
+_ST_DTYPES = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16}
+# transcoder -> {(path, name, size, mtime): view}; entries go away with their transcoder
+_MMAP_VIEWS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _safetensors_mmap_view(transcoder, name: str) -> torch.Tensor | None:
+    """Zero-copy CPU view (copy-on-write mmap) of tensor ``name`` in the transcoder's
+    safetensors file.
+
+    Views are cached per transcoder (weakly: the mapping is dropped when the transcoder
+    is garbage-collected) and per (path, size, mtime), so the page tables are only built
+    once per model. Returns None if the file/tensor cannot be mapped (callers fall back).
+    """
+    path = transcoder.transcoder_path
+    if path is None:
+        return None
+    try:
+        stat = os.stat(path)
+        key = (path, name, stat.st_size, stat.st_mtime_ns)
+        views = _MMAP_VIEWS.setdefault(transcoder, {})
+        view = views.get(key)
+        if view is None:
+            with open(path, "rb") as fh:
+                n_header = struct.unpack("<Q", fh.read(8))[0]
+                header = json.loads(fh.read(n_header))
+            meta = header[name]
+            dtype = _ST_DTYPES[meta["dtype"]]
+            begin, end = meta["data_offsets"]
+            raw = np.memmap(
+                path, dtype=np.uint8, mode="c", offset=8 + n_header + begin, shape=(end - begin,)
+            )
+            view = torch.from_numpy(raw).view(dtype).view(meta["shape"])
+            for stale in [k for k in views if k[1] == name]:  # the file was replaced
+                del views[stale]
+            views[key] = view
+        return view
+    except Exception:
+        return None
+
+
+def _upload_rows_pipelined(jobs, out: torch.Tensor, chunk_rows: int = 4096, n_bufs: int = 3):
+    """``out[offset : offset + len(idx)] = src[idx]`` for each ``(src, idx, offset)`` in
+    ``jobs``.
+
+    ``src`` are CPU tensors, ``idx`` CPU index tensors, ``out`` a CUDA tensor. A worker
+    thread gathers chunks of rows into a small ring of pinned buffers while the
+    previous chunks are copied to the device asynchronously.
+    """
+    chunks = [
+        (src, idx[start : start + chunk_rows], offset + start)
+        for src, idx, offset in jobs
+        for start in range(0, len(idx), chunk_rows)
+    ]
+    if not chunks:
+        return
+    n_bufs = min(n_bufs, len(chunks))
+    bufs = [
+        torch.empty(chunk_rows, out.shape[1], dtype=out.dtype, pin_memory=True)
+        for _ in range(n_bufs)
+    ]
+
+    def gather(i):
+        src, idx, _ = chunks[i]
+        buf = bufs[i % n_bufs][: len(idx)]
+        torch.index_select(src, 0, idx, out=buf)
+        return buf
+
+    # events and the final sync must use out's device (the model may not be on the
+    # current device)
+    with torch.cuda.device(out.device), ThreadPoolExecutor(max_workers=1) as executor:
+        futures = deque(executor.submit(gather, i) for i in range(n_bufs))
+        for i in range(len(chunks)):
+            buf = futures.popleft().result()
+            _, idx, offset = chunks[i]
+            out[offset : offset + len(idx)].copy_(buf, non_blocking=True)
+            copied = torch.cuda.Event()
+            copied.record()
+            next_chunk = i + n_bufs
+            if next_chunk < len(chunks):
+                copied.synchronize()  # buffer i % n_bufs is reused by chunk next_chunk
+                futures.append(executor.submit(gather, next_chunk))
+        torch.cuda.current_stream().synchronize()  # pinned buffers are freed on return
+
+
+_BITS = {1: np.uint8, 2: np.int16, 4: np.int32, 8: np.int64}
+_TORCH_BITS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _bits(tensor: torch.Tensor) -> np.ndarray:
+    """A CPU tensor's bits as a numpy array (numpy has no bfloat16)."""
+    return tensor.detach().view(_TORCH_BITS[tensor.itemsize]).numpy()
+
+
+class LazyEncoderVectors:
+    """Stand-in for the ``(n_active, d_model)`` encoder-vector tensor of a TranscoderSet.
+
+    Indexing with active-feature indices gathers the corresponding rows of each layer's
+    ``W_enc`` (bit-identical to the materialized tensor). Lazily-loaded encoders are read
+    row by row from their safetensors file instead of loading the whole ``W_enc``.
+    ``materialize()`` builds the full tensor.
+
+    Args:
+        transcoder_set (TranscoderSet): The transcoders whose ``W_enc`` rows are read.
+        indices (torch.Tensor): (3, n_active) ``(layer, pos, feature)`` indices of the
+            active features (the coalesced activation matrix's indices).
+    """
+
+    def __init__(self, transcoder_set: "TranscoderSet", indices: torch.Tensor):
+        self.transcoder_set = transcoder_set
+        self.layers = indices[0]
+        self.features = indices[2]
+        self.d_model = transcoder_set[0].d_model
+        # dtype of W_enc as the eager path returns it (lazy W_enc is cast to the
+        # transcoder's dtype on load); read without loading lazy weights
+        self.dtype = (
+            transcoder_set[0].dtype
+            if transcoder_set[0].lazy_encoder
+            else transcoder_set[0].W_enc.dtype
+        )
+        # per layer: None (read the module's W_enc) or (safetensors path, tensor name)
+        self._files: list = [
+            (transcoder.transcoder_path, "W_enc")
+            if transcoder.lazy_encoder and transcoder.transcoder_path
+            else None
+            for transcoder in transcoder_set
+        ]
+        self._host_index = None  # (layers, features) as numpy arrays, for host gathers
+
+    def __len__(self):
+        return self.layers.shape[0]
+
+    @property
+    def shape(self):
+        """``(n_active, d_model)``, like the tensor this stands in for."""
+        return torch.Size((len(self), self.d_model))
+
+    def read_from_offload_file(self, path: str):
+        """Read encoder rows from ``path`` while the transcoders themselves are offloaded.
+
+        Args:
+            path (str): A ``disk``-offloaded copy of the whole TranscoderSet's state dict.
+        """
+        names = {id(module): name for name, module in self.transcoder_set.named_modules()}
+        with safe_open(path, framework="pt", device="cpu") as f:
+            keys = set(f.keys())
+        for layer, transcoder in enumerate(self.transcoder_set.transcoders):
+            prefix = names[id(transcoder)]
+            key = f"{prefix}.W_enc" if prefix else "W_enc"
+            if key in keys:
+                self._files[layer] = (path, key)
+            elif self._files[layer] is None:
+                raise RuntimeError(f"W_enc of layer {layer} is not in the offload file {path}")
+
+    def _rows(self, layer: int, feats: torch.Tensor) -> torch.Tensor:
+        src = self._files[layer]
+        if src is None:
+            W_enc = self.transcoder_set[layer].W_enc
+            return W_enc[feats.to(W_enc.device)]
+        path, key = src
+        with safe_open(path, framework="pt", device="cpu") as f:
+            return f.get_slice(key)[feats.cpu()].to(self.dtype)
+
+    def _on_host(self, layer: int) -> bool:
+        src = self._files[layer]
+        return src is not None or self.transcoder_set[layer].W_enc.device.type == "cpu"
+
+    def __getitem__(self, idx) -> torch.Tensor:
+        """Encoder vectors of the active features ``idx``.
+
+        Args:
+            idx: Indices into the active features (a tensor or anything
+                ``torch.as_tensor`` accepts).
+
+        Returns:
+            torch.Tensor: ``(len(idx), d_model)`` rows on the activations' device.
+        """
+        # rows are returned on the activations' device even if the transcoders have been
+        # offloaded (attribute(..., offload="cpu"/"disk"))
+        device = self.layers.device
+        if device.type != "cpu" and any(self._on_host(layer) for layer in range(len(self._files))):
+            return self._gather_on_host(torch.as_tensor(idx).cpu(), device)
+        idx = torch.as_tensor(idx, device=device)
+        layers, feats = self.layers[idx], self.features[idx]
+        out = torch.empty(layers.shape[0], self.d_model, device=device, dtype=self.dtype)
+        for layer in layers.unique().tolist():
+            mask = layers == layer
+            out[mask] = self._rows(layer, feats[mask]).to(out.device)
+        return out
+
+    def _gather_on_host(self, idx: torch.Tensor, device) -> torch.Tensor:
+        """Rows of host-resident or file-backed encoders (offloaded or lazily loaded),
+        gathered on the host and uploaded in one copy.
+
+        The gather runs in numpy on raw bits: a handful of rows per layer is far below
+        what is worth a parallel torch kernel, whose thread wake-ups would dominate."""
+        if self._host_index is None:
+            self._host_index = (self.layers.cpu().numpy(), self.features.cpu().numpy())
+        layers, feats = (index[idx.numpy()] for index in self._host_index)
+        out = np.empty((len(layers), self.d_model), dtype=_BITS[self.dtype.itemsize])
+        on_device = []
+        for layer in np.unique(layers).tolist():
+            sel = np.flatnonzero(layers == layer)
+            if self._files[layer] is None:
+                W_enc = self.transcoder_set[layer].W_enc
+                if W_enc.device.type != "cpu":  # this layer's encoder is still on the device
+                    on_device.append((sel, W_enc[torch.from_numpy(feats[sel]).to(W_enc.device)]))
+                    continue
+                if W_enc.dtype == self.dtype:
+                    out[sel] = _bits(W_enc)[feats[sel]]
+                else:
+                    out[sel] = _bits(W_enc[torch.from_numpy(feats[sel])].to(self.dtype))
+            else:
+                out[sel] = _bits(self._rows(layer, torch.from_numpy(feats[sel])))
+        rows = torch.from_numpy(out).view(self.dtype).to(device)
+        for sel, device_rows in on_device:
+            rows[torch.from_numpy(sel).to(device)] = device_rows.to(device)
+        return rows
+
+    def materialize(self) -> torch.Tensor:
+        """The full encoder-vector tensor.
+
+        Returns:
+            torch.Tensor: The ``(n_active, d_model)`` tensor the eager path would have built.
+        """
+        return self[torch.arange(len(self), device=self.layers.device)]
