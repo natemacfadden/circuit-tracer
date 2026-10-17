@@ -247,13 +247,14 @@ def verify_feature_edges(
         verify_intervention(expected_effects, layer, pos, feature_idx, new_activation)  # type: ignore
 
 
-def load_dummy_gemma_model(cfg: AutoConfig) -> NNSightReplacementModel:
+def load_dummy_gemma_model(cfg: AutoConfig, device=None) -> NNSightReplacementModel:
     transcoders = {
         layer_idx: SingleLayerTranscoder(
             cfg.hidden_size,  # type: ignore
             cfg.hidden_size * 4,  # type: ignore
             JumpReLU(torch.tensor(0.0), 0.1),
             layer_idx,
+            device=device,
         )
         for layer_idx in range(cfg.num_hidden_layers)  # type: ignore
     }
@@ -265,7 +266,7 @@ def load_dummy_gemma_model(cfg: AutoConfig) -> NNSightReplacementModel:
         transcoders, feature_input_hook="hook_resid_mid", feature_output_hook="hook_mlp_out"
     )
 
-    model = ReplacementModel.from_config(cfg, transcoder_set, backend="nnsight")
+    model = ReplacementModel.from_config(cfg, transcoder_set, backend="nnsight", device=device)
 
     for _, param in model.named_parameters():
         nn.init.uniform_(param, a=-1, b=1)
@@ -319,7 +320,7 @@ def test_large_gemma_model():
     gemma_large_cfg.num_key_value_heads = 16
     gemma_large_cfg.final_logit_softcapping = None  # type:ignore
     gemma_large_cfg.torch_dtype = "float64"
-    model = load_dummy_gemma_model(gemma_large_cfg)  # type: ignore
+    model = load_dummy_gemma_model(gemma_large_cfg, device="cpu")  # type: ignore
 
     # Save original property to restore later
     tokenizer_class = type(model.tokenizer)

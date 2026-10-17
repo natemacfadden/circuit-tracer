@@ -102,7 +102,7 @@ def verify_freeze_linearity_hessian_tl(
             (second_deriv,) = torch.autograd.grad(
                 flat_grad[i],
                 embed_output[0],  # type: ignore
-                retain_graph=(i < n_check - 1),
+                retain_graph=True,  # the per-layer loop below reuses this graph
                 allow_unused=True,
             )
             if second_deriv is not None:
@@ -202,7 +202,7 @@ def verify_freeze_linearity_hessian_nnsight(
             (second_deriv,) = torch.autograd.grad(
                 flat_grad[i],
                 embed_out_saved,
-                retain_graph=(i < n_check - 1),
+                retain_graph=True,  # the per-layer loop below reuses this graph
                 allow_unused=True,
             )
             if second_deriv is not None:
